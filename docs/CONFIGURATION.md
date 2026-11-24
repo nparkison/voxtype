@@ -599,7 +599,7 @@ Also available as `--no-keep-failed-recordings` (and `--keep-failed-recordings` 
 **Default:** `false`
 **Required:** No
 
-When `true`, pauses currently playing MPRIS media players before microphone capture starts and resumes only those players as soon as capture stops. Transcription and text output continue without keeping playback paused.
+When `true`, pauses currently playing MPRIS media players before microphone capture starts and resumes only those players as soon as capture stops. Transcription and text output continue without keeping playback paused. A Bluetooth headset that switched to its microphone profile is resumed again once it is back on A2DP, because the first Play often lands while that transport is still down.
 
 ```toml
 [audio]

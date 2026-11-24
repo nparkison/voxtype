@@ -373,6 +373,7 @@ what is wrong instead of showing an empty pane:
 - [Performance Issues](#performance-issues)
 - [Soniox Backend Issues](#soniox-backend-issues)
 - [Media Does Not Pause While Recording (Omarchy Quattro)](#media-does-not-pause-while-recording-omarchy-quattro)
+- [Media stays paused after dictation on a Bluetooth headset](#media-stays-paused-after-dictation-on-a-bluetooth-headset)
 - [Quickshell OSD Issues](#quickshell-osd-issues)
 - [Meeting Audio and Post-Meeting Command](#meeting-audio-and-post-meeting-command)
   - [The recording announcement only played on my speakers](#the-recording-announcement-only-played-on-my-speakers)
@@ -2139,6 +2140,30 @@ An empty list means no MPRIS-capable player is running, which is a different
 problem from a missing `playerctl`. Some players (notably certain browsers)
 report unreliable MPRIS status; skip those with
 `pause_media_ignored_players`.
+
+## Media stays paused after dictation on a Bluetooth headset
+
+**Symptom:** Music pauses when you dictate and does not come back when you
+stop. Common when the headset microphone is the default input (AirPods, for
+example) and the music is playing on that same headset.
+
+**Cause:** Opening the microphone switches the headset from A2DP to the
+headset profile. Voxtype presses Play as soon as the microphone closes, which
+is before A2DP is back. The transport errors and the player stays paused.
+
+**What current builds do:** Play is pressed again for up to 12 seconds, once
+the headset card is on an A2DP profile and a stream is actually running. A new
+dictation cancels that retry, so music is not started underneath the next
+recording.
+
+If it still stays paused, check that the player is visible to Voxtype and not
+skipped:
+
+```bash
+busctl --user list | grep org.mpris.MediaPlayer2
+```
+
+A player listed in `pause_media_ignored_players` is never paused or resumed.
 
 ## OSD looks different after upgrading, or styles do nothing
 

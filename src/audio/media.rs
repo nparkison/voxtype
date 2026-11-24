@@ -17,6 +17,11 @@
 //! Talking D-Bus directly via zbus fixes both: we enumerate all owned
 //! names matching `org.mpris.MediaPlayer2.*` ourselves and surface real
 //! errors on resume.
+//!
+//! A headset that switches to HSP/HFP for the microphone needs one more
+//! step. `Play` sent the instant capture stops lands while A2DP is still
+//! coming back, the transport errors, and the player stays paused. Resume
+//! keeps pressing Play for a few seconds once the headset is on A2DP again.
 
 /// PulseAudio/PipeWire stream volume captured before media ducking.
 ///
@@ -33,10 +38,27 @@ pub struct DuckedMediaStream {
 mod imp {
     use super::DuckedMediaStream;
     use serde_json::Value;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
     use tokio::process::Command;
     use tokio::task::JoinHandle;
+    use tokio::time::sleep;
     use tracing::{debug, warn};
     use zbus::{fdo::DBusProxy, Connection, Proxy};
+
+    /// Bumped when a recording pauses players. A resume copies this value
+    /// when it is created and stops if the value changes, so Play cannot
+    /// land under the next dictation. The copy happens before the resume
+    /// is spawned: the task may not run until after that next pause.
+    static MEDIA_RESUME_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+    fn bump_media_resume_epoch() -> u64 {
+        MEDIA_RESUME_EPOCH.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn media_resume_cancelled(epoch: u64) -> bool {
+        MEDIA_RESUME_EPOCH.load(Ordering::Relaxed) != epoch
+    }
 
     const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
     const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
@@ -48,6 +70,8 @@ mod imp {
     /// either exactly or as a `<entry>.<instance>` prefix (so `"chromium"`
     /// matches `chromium.instance1872063`).
     pub async fn pause_playing_players(ignored: &[String]) -> Vec<String> {
+        // A resume may still be waiting for the headset to return to A2DP.
+        let _ = bump_media_resume_epoch();
         let conn = match Connection::session().await {
             Ok(c) => c,
             Err(e) => {
@@ -93,31 +117,305 @@ mod imp {
     }
 
     /// Resume previously-paused MPRIS media players.
-    pub async fn resume_players(players: Vec<String>) {
-        if players.is_empty() {
-            return;
-        }
-        let conn = match Connection::session().await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to connect to session bus for resume: {e}");
+    ///
+    /// The first Play goes out immediately so a speaker sink starts with the
+    /// mic. A Bluetooth headset is then given a few seconds to finish
+    /// switching back to A2DP, and Play is pressed again if the first one
+    /// did not stick.
+    ///
+    /// The epoch is read before this future is awaited or spawned. A later
+    /// pause bumps it and this resume will not press Play.
+    pub fn resume_players(players: Vec<String>) -> impl std::future::Future<Output = ()> + Send {
+        let epoch = MEDIA_RESUME_EPOCH.load(Ordering::Relaxed);
+        async move {
+            if players.is_empty() {
                 return;
             }
-        };
+            let conn = match Connection::session().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to connect to session bus for resume: {e}");
+                    return;
+                }
+            };
 
-        let mut resumed = 0usize;
-        for bus_name in &players {
-            debug!(player = %bus_name, "Resuming media player");
-            match call_player(&conn, bus_name, "Play").await {
-                Ok(()) => resumed += 1,
-                Err(e) => warn!(
-                    player = %bus_name,
-                    "Resume failed (player may have exited during dictation): {e}"
-                ),
+            if !press_play_unless_playing(&conn, &players, epoch).await {
+                debug!("No media players left to resume");
+                return;
+            }
+            settle_resumed_playback(&conn, &players, epoch).await;
+        }
+    }
+
+    /// How long to keep trying after the microphone closes. Long enough for
+    /// a headset to leave HSP/HFP and for the A2DP transport to survive the
+    /// error that follows the switch, short enough to give up if the player
+    /// is gone.
+    const RESUME_SETTLE: Duration = Duration::from_secs(12);
+
+    /// Playback that shows up before this, on a headset, is still the Play
+    /// that raced the profile switch. It usually dies with the transport.
+    const BLUETOOTH_TRANSPORT_SETTLE: Duration = Duration::from_secs(2);
+
+    /// Press Play on players that are not already playing.
+    ///
+    /// Returns false when every named player has left the bus, or when a new
+    /// recording cancelled this resume.
+    async fn press_play_unless_playing(conn: &Connection, players: &[String], epoch: u64) -> bool {
+        let mut any = false;
+        for bus_name in players {
+            if media_resume_cancelled(epoch) {
+                return false;
+            }
+            match player_status(conn, bus_name).await {
+                Ok(status) if status == "Playing" => any = true,
+                Ok(_) => {
+                    any = true;
+                    debug!(player = %bus_name, "Resuming media player");
+                    if let Err(e) = call_player(conn, bus_name, "Play").await {
+                        warn!(
+                            player = %bus_name,
+                            "Resume failed (player may have exited during dictation): {e}"
+                        );
+                    }
+                }
+                Err(e) => debug!(player = %bus_name, "Status query failed: {e}"),
             }
         }
+        any
+    }
 
-        debug!("Resumed {}/{} media player(s)", resumed, players.len());
+    /// Keep checking until resumed playback survives the headset switch.
+    async fn settle_resumed_playback(conn: &Connection, players: &[String], epoch: u64) {
+        let started = Instant::now();
+        let deadline = started + RESUME_SETTLE;
+        let mut saw_route = false;
+        while Instant::now() < deadline {
+            if media_resume_cancelled(epoch) {
+                debug!("Media resume cancelled");
+                return;
+            }
+            let route = match current_audio_route().await {
+                Ok(route) => route,
+                Err(e) => {
+                    debug!("Media route unavailable while resuming: {e}");
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+            saw_route = true;
+            if !route.ready {
+                sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            // The profile can flap. Wait one beat and read it again.
+            sleep(Duration::from_millis(400)).await;
+            if media_resume_cancelled(epoch) {
+                return;
+            }
+            let route = match current_audio_route().await {
+                Ok(route) if route.ready => route,
+                _ => continue,
+            };
+            if !press_play_unless_playing(conn, players, epoch).await {
+                debug!("No media players left to resume");
+                return;
+            }
+            sleep(Duration::from_secs(1)).await;
+            if media_resume_cancelled(epoch) {
+                return;
+            }
+            if resumed_playback_held(conn, players, &route).await {
+                // On a headset, a Playing status in the first two seconds is
+                // the Play that races the transport error. Do not treat it
+                // as settled, and do not pause it just to nudge.
+                if route.bluetooth && started.elapsed() < BLUETOOTH_TRANSPORT_SETTLE {
+                    continue;
+                }
+                sleep(Duration::from_millis(1200)).await;
+                if media_resume_cancelled(epoch) {
+                    return;
+                }
+                let route = match current_audio_route().await {
+                    Ok(route) if route.ready => route,
+                    _ => continue,
+                };
+                if resumed_playback_held(conn, players, &route).await {
+                    debug!("Resumed media stayed playing");
+                    return;
+                }
+            }
+            debug!("Media resume did not stick, trying again");
+            if media_resume_cancelled(epoch) {
+                return;
+            }
+            nudge_players(conn, players, epoch).await;
+        }
+        if saw_route {
+            warn!("Gave up waiting for media to resume");
+        } else {
+            debug!("Media resume settle skipped; pactl could not describe the default sink");
+        }
+    }
+
+    /// Pause anything that claims to be playing, then press Play.
+    ///
+    /// A player left at Playing with no stream ignores a second Play. The
+    /// pause makes the next Play a real transition.
+    async fn nudge_players(conn: &Connection, players: &[String], epoch: u64) {
+        for bus_name in players {
+            if media_resume_cancelled(epoch) {
+                return;
+            }
+            if player_status(conn, bus_name).await.ok().as_deref() == Some("Playing") {
+                let _ = call_player(conn, bus_name, "Pause").await;
+            }
+            if media_resume_cancelled(epoch) {
+                return;
+            }
+            let _ = call_player(conn, bus_name, "Play").await;
+        }
+    }
+
+    /// True when every player still on the bus is Playing, and a headset
+    /// sink actually has someone else's stream on it.
+    async fn resumed_playback_held(
+        conn: &Connection,
+        players: &[String],
+        route: &AudioRoute,
+    ) -> bool {
+        let mut any = false;
+        for bus_name in players {
+            match player_status(conn, bus_name).await {
+                Ok(status) if status == "Playing" => any = true,
+                Ok(_) => return false,
+                Err(e) => debug!(player = %bus_name, "Status query failed: {e}"),
+            }
+        }
+        if !any {
+            return false;
+        }
+        if !route.bluetooth {
+            return true;
+        }
+        let Some(sink_index) = route.sink_index else {
+            return false;
+        };
+        bluetooth_has_foreign_input(sink_index).await
+    }
+
+    async fn bluetooth_has_foreign_input(sink_index: u32) -> bool {
+        let (inputs, clients) = tokio::join!(pactl_list("sink-inputs"), pactl_list("clients"));
+        let Ok(inputs) = inputs else {
+            return false;
+        };
+        let clients = clients.unwrap_or(Value::Null);
+        sink_has_foreign_input(sink_index, &inputs, &clients, std::process::id())
+    }
+
+    async fn current_audio_route() -> Result<AudioRoute, String> {
+        let output = Command::new("pactl")
+            .args(["get-default-sink"])
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "pactl get-default-sink exited with {}",
+                output.status
+            ));
+        }
+        let name = String::from_utf8_lossy(&output.stdout);
+        let (sinks, cards) = tokio::join!(pactl_list("sinks"), pactl_list("cards"));
+        Ok(audio_route(name.trim(), &sinks?, &cards?))
+    }
+
+    /// Where music should come back, and whether that sink can take it yet.
+    struct AudioRoute {
+        bluetooth: bool,
+        ready: bool,
+        sink_index: Option<u32>,
+    }
+
+    /// `default_sink` is `pactl get-default-sink`. A `bluez_output` sink is
+    /// ready only once its card is on an A2DP profile and a sink for that
+    /// address exists. Any other sink is ready immediately.
+    fn audio_route(default_sink: &str, sinks: &Value, cards: &Value) -> AudioRoute {
+        if let Some((card, prefix)) = bluetooth_identity(default_sink) {
+            let profile = card_active_profile(cards, &card).unwrap_or("");
+            let on_a2dp = profile.starts_with("a2dp");
+            let sink_index = if on_a2dp {
+                sink_index_matching(sinks, |name| name == default_sink)
+                    .or_else(|| sink_index_matching(sinks, |name| name.starts_with(&prefix)))
+            } else {
+                None
+            };
+            return AudioRoute {
+                bluetooth: true,
+                ready: sink_index.is_some(),
+                sink_index,
+            };
+        }
+        AudioRoute {
+            bluetooth: false,
+            ready: true,
+            sink_index: sink_index_matching(sinks, |name| name == default_sink),
+        }
+    }
+
+    /// `bluez_output.ADDR.N` -> card `bluez_card.ADDR` and sink prefix
+    /// `bluez_output.ADDR.`.
+    fn bluetooth_identity(sink_name: &str) -> Option<(String, String)> {
+        let rest = sink_name.strip_prefix("bluez_output.")?;
+        let (addr, _) = rest.rsplit_once('.')?;
+        if addr.is_empty() {
+            return None;
+        }
+        Some((
+            format!("bluez_card.{addr}"),
+            format!("bluez_output.{addr}."),
+        ))
+    }
+
+    fn card_active_profile<'a>(cards: &'a Value, card_name: &str) -> Option<&'a str> {
+        cards.as_array()?.iter().find_map(|card| {
+            if card.get("name").and_then(Value::as_str) == Some(card_name) {
+                card.get("active_profile").and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn sink_index_matching(sinks: &Value, predicate: impl Fn(&str) -> bool) -> Option<u32> {
+        sinks.as_array()?.iter().find_map(|sink| {
+            let name = sink.get("name").and_then(Value::as_str)?;
+            if predicate(name) {
+                sink.get("index").and_then(value_as_u32)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn sink_has_foreign_input(
+        sink_index: u32,
+        inputs: &Value,
+        clients: &Value,
+        own_pid: u32,
+    ) -> bool {
+        let Some(streams) = inputs.as_array() else {
+            return false;
+        };
+        streams.iter().any(|stream| {
+            stream.get("sink").and_then(value_as_u32) == Some(sink_index)
+                && !stream.get("mute").and_then(Value::as_bool).unwrap_or(false)
+                && !stream
+                    .get("corked")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                && !is_voxtype_stream(stream, clients, own_pid)
+        })
     }
 
     /// Interval between ramp steps. Short enough to sound continuous, long
@@ -750,6 +1048,102 @@ mod imp {
             // percentage. The pre-change behaviour would have produced "50%",
             // which is only 12.5% of the amplitude.
             assert_eq!(scaled_volumes(&["100%".to_string()], 50), vec!["79%"]);
+        }
+
+        fn sink(name: &str, index: u32) -> Value {
+            serde_json::json!({ "index": index, "name": name })
+        }
+
+        fn card(name: &str, profile: &str) -> Value {
+            serde_json::json!({ "name": name, "active_profile": profile })
+        }
+
+        #[test]
+        fn a_speaker_sink_is_ready_without_waiting_for_bluetooth() {
+            let sinks = serde_json::json!([sink("alsa_output.pci.Speaker", 60)]);
+            let route = audio_route("alsa_output.pci.Speaker", &sinks, &serde_json::json!([]));
+            assert!(!route.bluetooth);
+            assert!(route.ready);
+            assert_eq!(route.sink_index, Some(60));
+        }
+
+        #[test]
+        fn a_headset_profile_is_not_ready_to_resume() {
+            let name = "bluez_output.7C_2A_CA_E8_36_C1.1";
+            let route = audio_route(
+                name,
+                &serde_json::json!([sink(name, 10)]),
+                &serde_json::json!([card("bluez_card.7C_2A_CA_E8_36_C1", "headset-head-unit")]),
+            );
+            assert!(route.bluetooth);
+            assert!(!route.ready);
+            assert_eq!(route.sink_index, None);
+        }
+
+        #[test]
+        fn a2dp_uses_the_sink_that_came_back_for_the_same_address() {
+            let sinks = serde_json::json!([
+                sink("alsa_output.Speaker", 4),
+                sink("bluez_output.7C_2A_CA_E8_36_C1.1", 108)
+            ]);
+            let cards = serde_json::json!([card("bluez_card.7C_2A_CA_E8_36_C1", "a2dp-sink")]);
+            // The default sink name can still be the headset-profile node
+            // while the A2DP node is the one that exists.
+            let route = audio_route("bluez_output.7C_2A_CA_E8_36_C1.0", &sinks, &cards);
+            assert!(route.ready);
+            assert_eq!(route.sink_index, Some(108));
+        }
+
+        #[test]
+        fn an_sbc_xq_profile_counts_as_a2dp() {
+            let name = "bluez_output.AA_BB.1";
+            let route = audio_route(
+                name,
+                &serde_json::json!([sink(name, 1)]),
+                &serde_json::json!([card("bluez_card.AA_BB", "a2dp-sink-sbc_xq")]),
+            );
+            assert!(route.bluetooth);
+            assert!(route.ready);
+            assert_eq!(route.sink_index, Some(1));
+        }
+
+        #[test]
+        fn a_foreign_stream_counts_and_voxtype_or_corked_streams_do_not() {
+            let inputs = serde_json::json!([
+                {"index": 1, "sink": 10, "mute": false, "corked": true, "properties": {}},
+                {
+                    "index": 2,
+                    "sink": 10,
+                    "mute": false,
+                    "corked": false,
+                    "properties": {"application.process.binary": "voxtype"}
+                },
+                {
+                    "index": 3,
+                    "sink": 11,
+                    "mute": false,
+                    "corked": false,
+                    "properties": {"application.name": "Chromium"}
+                },
+                {
+                    "index": 4,
+                    "sink": 11,
+                    "mute": true,
+                    "corked": false,
+                    "properties": {"application.name": "Chromium"}
+                }
+            ]);
+            assert!(!sink_has_foreign_input(10, &inputs, &Value::Null, 1));
+            assert!(sink_has_foreign_input(11, &inputs, &Value::Null, 1));
+        }
+
+        #[test]
+        fn a_new_pause_cancels_the_resume_that_was_settling() {
+            // Same capture resume_players does before it is spawned.
+            let epoch = MEDIA_RESUME_EPOCH.load(Ordering::Relaxed);
+            assert!(!media_resume_cancelled(epoch));
+            let _ = bump_media_resume_epoch();
+            assert!(media_resume_cancelled(epoch));
         }
     }
 }
